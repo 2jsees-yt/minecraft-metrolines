@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Minecraft Metro Route Planner — Jouw Netwerk</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body,html{height:100%;margin:0;font-family:Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Arial}
+    #map{position:absolute;top:0;left:320px;right:0;bottom:0}
+    #sidebar{position:absolute;left:0;top:0;bottom:0;width:320px;background:#f8f9fb;border-right:1px solid #e6e9ee;padding:14px;overflow:auto}
+    h2{margin:6px 0 12px;font-size:18px}
+    .btn{display:inline-block;padding:6px 10px;margin:6px 4px;border-radius:8px;background:#0b69ff;color:#fff;text-decoration:none;cursor:pointer;border:none}
+    .btn.secondary{background:#4caf50}
+    label{display:block;margin-top:10px;font-weight:600}
+    select,input,textarea{width:100%;padding:8px;margin-top:6px;box-sizing:border-box;border-radius:6px;border:1px solid #d6dbe8}
+    .station-item{padding:8px;border-bottom:1px solid #eef2f7}
+    .route-result{background:#fff;padding:10px;border-radius:8px;margin-top:10px;border:1px solid #eef2f7}
+    small{color:#6b7280}
+    .muted{color:#6b7280;font-size:13px}
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <h2>Minecraft Metro — Jouw Netwerk</h2>
+    <p class="muted">Deze versie is geladen met jouw stations en lijnen (inclusief directe verbindingen naar Centrum). Plan routes, zie haltes en overstappen.</p>
+
+    <label>Data (JSON)</label>
+    <textarea id="jsonInput" rows="8"></textarea>
+    <div style="margin-top:8px">
+      <button id="loadJson" class="btn">Laad in planner</button>
+      <button id="downloadJson" class="btn secondary">Download JSON</button>
+    </div>
+
+    <hr />
+    <label>Stations (klik op kaart voor popup)</label>
+    <div id="stationsList"></div>
+
+    <hr />
+    <label>Route plannen</label>
+    <select id="fromSelect"></select>
+    <select id="toSelect" style="margin-top:6px"></select>
+    <div style="margin-top:8px">
+      <button id="planBtn" class="btn">Plan route</button>
+    </div>
+
+    <div id="routeOutput"></div>
+
+    <hr />
+    <small>Uitleg: de planner berekent een route met minimale overstappen en daarna minimale haltes. Transfers worden getoond en haltes geteld. Gebruik de knop "Download JSON" om je netwerk op te slaan.</small>
+  </div>
+
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // --- VOORINGEVULD NETWERK (jouw data) -------------------------------------------------
+    const initialData = {
+      "stations": [
+        {"id":"CENTRUM","name":"Centrum","x":-275,"z":1807},
+        {"id":"BAAIS","name":"Baais","x":-299,"z":1852},
+        {"id":"SILAS","name":"Silas","x":-247,"z":1827},
+        {"id":"ELIAS","name":"Elias","x":-234,"z":1781},
+        {"id":"MASAL","name":"Masal","x":-319,"z":1803},
+        {"id":"BRUG","name":"Brug","x":-220,"z":1933}
+      ],
+      "lines": [
+        {"id":"L_BAAIS","name":"Lijn Baais","stations":["SILAS","ELIAS","MASAL","BAAIS"]},
+        {"id":"L_SILAS","name":"Lijn Silas","stations":["BAAIS","MASAL","ELIAS","SILAS"]},
+        {"id":"L_BRUG","name":"Lijn Brug","stations":["CENTRUM","BRUG"]}
+      ],
+      "radialToCenter": true
+    };
+
+    // --- MAP SETUP ----------------------------------------------------------------------
+    const map = L.map('map', {crs: L.CRS.Simple, minZoom:-5, maxZoom:5});
+    const bounds = [[-10000,-10000],[10000,10000]];
+    L.rectangle(bounds,{weight:0,fill:false}).addTo(map);
+    map.fitBounds(bounds);
+
+    // layers
+    const stationLayer = L.layerGroup().addTo(map);
+    const lineLayer = L.layerGroup().addTo(map);
+    let routeLayer = null;
+
+    // internal state
+    let stations = [];
+    let lines = [];
+
+    // helpers
+    function coordToLatLng(x,z){ return [-z, x]; }
+    function idFor(name){ return name.toUpperCase().replace(/\s+/g,'_'); }
+
+    function render(){
+      stationLayer.clearLayers(); lineLayer.clearLayers();
+
+      // draw lines
+      for(const ln of lines){
+        const pts = ln.stations.map(id=>{ const s = stations.find(x=>x.id===id); return s ? coordToLatLng(s.x,s.z) : null; }).filter(Boolean);
+        if(pts.length>1){ L.polyline(pts, {weight:6, opacity:0.9}).addTo(lineLayer); }
+      }
+
+      // draw radial center links (dashed)
+      if(window.network.radialToCenter){
+        const center = stations.find(s=>s.id==='CENTRUM');
+        if(center){
+          for(const s of stations){ if(s.id!==center.id){ L.polyline([coordToLatLng(center.x,center.z), coordToLatLng(s.x,s.z)], {weight:2, dashArray:'6,6', opacity:0.6}).addTo(lineLayer); } }
+        }
+      }
+
+      // draw stations
+      for(const s of stations){
+        const m = L.circleMarker(coordToLatLng(s.x,s.z), {radius:8}).addTo(stationLayer);
+        m.bindPopup(`<strong>${s.name}</strong><br>ID: ${s.id}<br>(${s.x}, ${s.z})<br><small>Lijnen: ${lines.filter(l=>l.stations.includes(s.id)).map(l=>l.name).join(', ')}</small>`);
+      }
+
+      refreshLists();
+    }
+
+    function refreshLists(){
+      const sl = document.getElementById('stationsList'); sl.innerHTML='';
+      for(const s of stations){ const div = document.createElement('div'); div.className='station-item'; div.innerHTML = `<b>${s.name}</b> <small>(${s.id})</small><br>X:${s.x} Z:${s.z}`; sl.appendChild(div); }
+      const from = document.getElementById('fromSelect'); const to = document.getElementById('toSelect'); from.innerHTML=''; to.innerHTML='';
+      for(const s of stations){ const o1 = document.createElement('option'); o1.value=s.id; o1.textContent = `${s.name} (${s.id})`; const o2 = o1.cloneNode(true); from.appendChild(o1); to.appendChild(o2); }
+    }
+
+    // load initial JSON into textarea
+    document.getElementById('jsonInput').value = JSON.stringify(initialData, null, 2);
+
+    // load JSON button
+    document.getElementById('loadJson').addEventListener('click', ()=>{
+      try{
+        const obj = JSON.parse(document.getElementById('jsonInput').value);
+        // normalize stations ids
+        stations = (obj.stations||[]).map(s=>({ id: (s.id||idFor(s.name)).toUpperCase(), name: s.name, x: Number(s.x), z: Number(s.z) }));
+        lines = (obj.lines||[]).map(l=>({ id: (l.id||idFor(l.name)).toUpperCase(), name: l.name, stations: l.stations.map(x=> (typeof x==='string'? x.toUpperCase() : x)) }));
+        window.network = { radialToCenter: Boolean(obj.radialToCenter) };
+        render();
+      }catch(e){ alert('Invalid JSON: '+e.message); }
+    });
+
+    // download JSON
+    document.getElementById('downloadJson').addEventListener('click', ()=>{
+      const data = { stations: stations.map(s=>({id:s.id,name:s.name,x:s.x,z:s.z})), lines: lines.map(l=>({id:l.id,name:l.name,stations:l.stations})), radialToCenter: Boolean(window.network.radialToCenter) };
+      const blob = new Blob([JSON.stringify(data,null,2)], {type:'application/json'});
+      const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href=url; a.download='metro-data.json'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    });
+
+    // --- ROUTE-FINDER met overstappen -----------------------------------------------------
+    // We'll run a Dijkstra-like search on states {station, line} minimizing [transfers, stops]
+    function buildAdjacency(){
+      const adj = {};
+      for(const s of stations) adj[s.id]=new Set();
+      // connect successive stations on each line
+      for(const ln of lines){
+        for(let i=0;i<ln.stations.length-1;i++){
+          const a=ln.stations[i], b=ln.stations[i+1]; if(adj[a] && adj[b]){ adj[a].add(b); adj[b].add(a); }
+        }
+      }
+      // radial center links
+      if(window.network.radialToCenter){ const center = 'CENTRUM'; for(const s of stations){ if(s.id!==center && adj[s.id] && adj[center]){ adj[s.id].add(center); adj[center].add(s.id); } }
+      }
+      // convert to arrays
+      const obj={}; for(const k in adj) obj[k]=Array.from(adj[k]); return obj;
+    }
+
+    // helper: get lines that connect two adjacent stations (both directions)
+    function linesBetween(a,b){ return lines.filter(l=>{
+      for(let i=0;i<l.stations.length-1;i++){ if((l.stations[i]===a && l.stations[i+1]===b) || (l.stations[i]===b && l.stations[i+1]===a)) return true; }
+      // also if line is exactly [a,b]
+      if(l.stations.length===2 && ((l.stations[0]===a && l.stations[1]===b)||(l.stations[0]===b && l.stations[1]===a))) return true;
+      return false;
+    }); }
+
+    // priority queue simple
+    class PQ{ constructor(){ this._data=[];} push(pri,val){ this._data.push({p:pri,v:val}); this._data.sort((a,b)=>{ if(a.p[0]!==b.p[0]) return a.p[0]-b.p[0]; return a.p[1]-b.p[1]; }); } pop(){ return this._data.shift(); } isEmpty(){ return this._data.length===0; } }
+
+    function findBestRoute(start,goal){
+      const graph = buildAdjacency();
+      if(!graph[start]||!graph[goal]) return null;
+      // state: station + currentLine (null allowed)
+      const pq = new PQ();
+      // store best cost seen: key -> [transfers,stops]
+      const best = {};
+      const prev = {}; // key -> {prevKey, viaLine}
+
+      function key(station,line){ return station + '||' + (line||'__NONE__'); }
+
+      // initial states: allow starting on any line or none
+      const startKey = key(start,null);
+      best[startKey] = [0,0]; pq.push([0,0], {station:start,line:null}); prev[startKey] = null;
+
+      while(!pq.isEmpty()){
+        const {p, v} = pq.pop(); const [transfers,stops]=p; const {station, line} = v; const k = key(station,line);
+        // if this state is worse than recorded, skip
+        const recorded = best[k]; if(recorded && (recorded[0]<transfers || (recorded[0]===transfers && recorded[1]<stops))) continue;
+        if(station===goal){ // reconstruct
+          // find best among all line states for goal
+          break;
+        }
+        // explore neighbors
+        for(const nb of graph[station]){
+          // possible lines to take for edge station->nb
+          const candidateLines = linesBetween(station,nb).map(x=>x.id);
+          // if radial center edge exists but no line, candidateLines may be empty -> we still allow travel with '__RADIAL__'
+          if(candidateLines.length===0 && window.network.radialToCenter) candidateLines.push('__RADIAL__');
+
+          for(const ln of candidateLines){
+            // cost: +1 stop, +1 transfer if changing line (and previous line not null and different)
+            const addStop = 1;
+            const addTransfer = (line===null || line===ln) ? 0 : 1;
+            const newTrans = transfers + addTransfer;
+            const newStops = stops + addStop;
+            const nk = key(nb,ln);
+            const prevBest = best[nk];
+            const better = !prevBest || (newTrans < prevBest[0]) || (newTrans===prevBest[0] && newStops < prevBest[1]);
+            if(better){ best[nk]=[newTrans,newStops]; prev[nk]={prevKey:k, viaLine:ln}; pq.push([newTrans,newStops], {station:nb,line:ln}); }
+          }
+        }
+      }
+
+      // pick best end state
+      let bestEnd=null; let bestCost=null; for(const k in best){ if(k.startsWith(goal+'||')){ const c = best[k]; if(!bestCost || (c[0]<bestCost[0] || (c[0]===bestCost[0] && c[1]<bestCost[1]))){ bestCost=c; bestEnd=k; } } }
+      if(!bestEnd) return null;
+      // reconstruct path
+      const pathStates = [];
+      let cur = bestEnd;
+      while(cur){ const parts = cur.split('||'); const st = parts[0]; const ln = parts[1]==='__NONE__'? null: parts[1]; pathStates.push({station:st,line:ln}); cur = prev[cur] ? prev[cur].prevKey : null; }
+      pathStates.reverse();
+      // compress into station sequence with line segments
+      const stationsSeq = pathStates.map(s=>s.station);
+      // derive segments with line names (show when the train is on which line)
+      const segments = [];
+      let segLine = pathStates[0].line; let segStations = [pathStates[0].station];
+      for(let i=1;i<pathStates.length;i++){
+        const ps = pathStates[i];
+        if(ps.line === segLine){ segStations.push(ps.station); } else { segments.push({line:segLine, stations:segStations.slice()}); segLine = ps.line; segStations = [pathStates[i-1].station, ps.station]; }
+      }
+      segments.push({line:segLine, stations:segStations});
+
+      return {stations: stationsSeq, segments, cost: bestCost};
+    }
+
+    // UI: plan route
+    document.getElementById('planBtn').addEventListener('click', ()=>{
+      const from = document.getElementById('fromSelect').value; const to = document.getElementById('toSelect').value;
+      const out = document.getElementById('routeOutput'); out.innerHTML='';
+      if(from===to){ out.innerHTML='<div class="route-result">Je zit al op het eindstation.</div>'; return; }
+      const res = findBestRoute(from,to);
+      if(!res){ out.innerHTML='<div class="route-result">Geen route gevonden.</div>'; return; }
+      const rdiv = document.createElement('div'); rdiv.className='route-result';
+      // display summary
+      rdiv.innerHTML = `<b>Route van ${stations.find(s=>s.id===from).name} → ${stations.find(s=>s.id===to).name}</b><br><small class=\"muted\">Haltes: ${res.cost[1]}, Overstappen: ${res.cost[0]}</small><hr>`;
+      // show segments
+      for(const seg of res.segments){
+        const lineName = seg.line==='__RADIAL__' ? 'Direct (Centrum-verbinding)' : (lines.find(l=>l.id===seg.line)?.name || (seg.line||'Niet gespecificeerd'));
+        const segEl = document.createElement('div'); segEl.style.marginBottom='8px';
+        segEl.innerHTML = `<div style=\"font-weight:700;margin-bottom:4px\">${lineName}</div>` + seg.stations.map(sid=> (stations.find(s=>s.id===sid)||{name:sid}).name + ` <small>(${sid})</small>`).join('<br>');
+        rdiv.appendChild(segEl);
+      }
+      out.appendChild(rdiv);
+
+      // draw route on map
+      if(routeLayer) map.removeLayer(routeLayer);
+      const pts = res.stations.map(id=>{ const s = stations.find(x=>x.id===id); return coordToLatLng(s.x,s.z); });
+      routeLayer = L.layerGroup();
+      L.polyline(pts, {weight:8}).addTo(routeLayer);
+      // mark stops
+      for(const id of res.stations){ const s = stations.find(x=>x.id===id); L.circleMarker(coordToLatLng(s.x,s.z), {radius:6}).bindPopup(`${s.name}`).addTo(routeLayer); }
+      routeLayer.addTo(map);
+      map.fitBounds(L.polyline(pts).getBounds(), {padding:[40,40]});
+    });
+
+    // auto-load initial data
+    document.getElementById('loadJson').click();
+  </script>
+</body>
+</html>
